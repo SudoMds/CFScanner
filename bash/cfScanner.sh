@@ -842,7 +842,7 @@ fi
 now=$(date +"%Y%m%d-%H%M%S")
 scriptDir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 resultDir="$scriptDir/result"
-resultFile="$resultDir/$now-result.cf"
+resultFile="$resultDir/result.cf"
 tempConfigDir="$scriptDir/tempConfig"
 filesDir="$tempConfigDir"
 
