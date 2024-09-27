@@ -1,918 +1,277 @@
-#!/bin/bash  -
-#===============================================================================
-#
-#          FILE: cfScanner.sh
-#
-#         USAGE: ./cfScanner.sh [Argumets]
-#
-#   DESCRIPTION: Scan all 1.5 Mil CloudFlare IP addresses
-#
-#       OPTIONS: -h, --help
-#  REQUIREMENTS: getopt, jq, git, tput, bc, curl, parallel (version > 20220515), shuf
-#        AUTHOR: Morteza Bashsiz (mb), morteza.bashsiz@gmail.com
-#  ORGANIZATION: Linux
-#       CREATED: 01/24/2023 07:36:57 PM
-#      REVISION: nomadzzz, armgham, beh-rouz, amini8, mahdibahramih, armineslami, miytiy, F4RAN 
-#===============================================================================
+#!/usr/bin/env python3
+import subprocess
+import sys
+import os
+import argparse
+import logging
+import time
 
-export TOP_PID=$$
+# Constants for configuration and IP files
+CONFIG_FILE = 'settings.txt'
+IP_FILE = 'ips.txt'
 
-# Function fncLongIntToStr
-# converts IP in long integer format to a string 
-fncLongIntToStr() {
-    local IFS=. num quad ip e
-    num=$1
-    for e in 3 2 1
-    do
-        (( quad = 256 ** e))
-        (( ip[3-e] = num / quad ))
-        (( num = num % quad ))
-    done
-    ip[3]=$num
-    echo "${ip[*]}"
-}
-# End of Function fncLongIntToStr
+# Configure logging
+logging.basicConfig(
+    filename='cloudflare_updater.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-# Function fncIpToLongInt
-# converts IP to long integer 
-fncIpToLongInt() {
-    local IFS=. ip num e
-		# shellcheck disable=SC2206
-    ip=($1)
-    for e in 3 2 1
-    do
-        (( num += ip[3-e] * 256 ** e ))
-    done
-    (( num += ip[3] ))
-    echo $num
-}
-# End of Function fncIpToLongInt
+def install_requirements(requirements_file):
+    """
+    Install packages from a requirements file.
+    
+    Args:
+        requirements_file (str): Path to the requirements file.
+    """
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", requirements_file])
+        logging.info("Requirements installed successfully from %s.", requirements_file)
+    except subprocess.CalledProcessError as e:
+        logging.error("Failed to install requirements from %s: %s", requirements_file, e)
+        sys.exit(1)
 
-# Function fncSubnetToIP
-# converts subnet to IP list
-fncSubnetToIP() {
-	# shellcheck disable=SC2206
-  local network=(${1//\// })
-	# shellcheck disable=SC2206
-  local iparr=(${network[0]//./ })
-  local mask=32
-  [[ $((${#network[@]})) -gt 1 ]] && mask=${network[1]}
+# Check if dependencies are installed
+try:
+    import CloudFlare
+except ImportError:
+    print("Installing packages from requirements.txt...")
+    logging.info("CloudFlare module not found. Installing dependencies.")
+    install_requirements("requirements.txt")
+    try:
+        import CloudFlare
+    except ImportError:
+        logging.error("Failed to import CloudFlare after installation.")
+        sys.exit(1)
 
-  local maskarr
-	# shellcheck disable=SC2206
-  if [[ ${mask} = '\.' ]]; then  # already mask format like 255.255.255.0
-    maskarr=(${mask//./ })
-  else                           # assume CIDR like /24, convert to mask
-    if [[ $((mask)) -lt 8 ]]; then
-      maskarr=($((256-2**(8-mask))) 0 0 0)
-    elif  [[ $((mask)) -lt 16 ]]; then
-      maskarr=(255 $((256-2**(16-mask))) 0 0)
-    elif  [[ $((mask)) -lt 24 ]]; then
-      maskarr=(255 255 $((256-2**(24-mask))) 0)
-    elif [[ $((mask)) -lt 32 ]]; then
-      maskarr=(255 255 255 $((256-2**(32-mask))))
-    elif [[ ${mask} == 32 ]]; then
-      maskarr=(255 255 255 255)
-    fi
-  fi
+def print_header():
+    """
+    Print a beautiful header to the console and log the action.
+    """
+    header = """
+====================================================
+         Cloudflare DNS Updater by MDS
+====================================================
+    """
+    print(header)
+    logging.info("Header printed.")
 
-  # correct wrong subnet masks (e.g. 240.192.255.0 to 255.255.255.0)
-  [[ ${maskarr[2]} == 255 ]] && maskarr[1]=255
-  [[ ${maskarr[1]} == 255 ]] && maskarr[0]=255
+def init_settings():
+    """
+    Initialize settings and save them to the configuration file.
+    
+    Allows users to input Cloudflare credentials and zone information.
+    Supports command-line arguments for automation.
+    """
+    print_header()
+    
+    parser = argparse.ArgumentParser(description="Initialize Cloudflare DNS Updater Settings")
+    parser.add_argument('--email', help='Cloudflare login email')
+    parser.add_argument('--api_key', help='Cloudflare global API key')
+    parser.add_argument('--zone', help='Cloudflare zone name (e.g., mydomain.com)')
+    parser.add_argument('--subdomain', help='Base subdomain to use (e.g., subdomain.mydomain.com)')
+    args, unknown = parser.parse_known_args()
 
-	# generate list of ip addresses
-	if [[ "$randomNumber" != "NULL" ]]
-	then
-  	local bytes=(0 0 0 0)
-  	for i in $(seq 0 $((255-maskarr[0]))); do
-  	  bytes[0]="$(( i+(iparr[0] & maskarr[0]) ))"
-  	  for j in $(seq 0 $((255-maskarr[1]))); do
-  	    bytes[1]="$(( j+(iparr[1] & maskarr[1]) ))"
-  	    for k in $(seq 0 $((255-maskarr[2]))); do
-  	      bytes[2]="$(( k+(iparr[2] & maskarr[2]) ))"
-  	      for l in $(seq 1 $((255-maskarr[3]))); do
-  	        bytes[3]="$(( l+(iparr[3] & maskarr[3]) ))"
-						ipList+=("$(printf "%d.%d.%d.%d" "${bytes[@]}")")
-  	      done
-  	    done
-  	  done
-  	done
-		# Choose random IP addresses from generated IP list
-		if [[ "$osVersion" == "Linux" ]]
-		then
-			mapfile -t ipList < <(shuf -e "${ipList[@]}")
-			mapfile -t ipList < <(shuf -e "${ipList[@]:0:$randomNumber}")
-		elif [[ "$osVersion" == "Mac"  ]]
-		then
-			# shellcheck disable=SC2207
-			ipList=($(printf '%s\n' "${ipList[@]}" | shuf))
-			# shellcheck disable=SC2207
-			ipList=($(printf '%s\n' "${ipList[@]:0:$randomNumber}" | shuf))
-		else
-			echo "OS not supported only Linux or Mac"
-			exit 1
-		fi
-  	for i in "${ipList[@]}"; do 
-  	  echo "$i"
-  	done
-	elif [[ "$randomNumber" == "NULL" ]]
-	then
-  	local bytes=(0 0 0 0)
-  	for i in $(seq 0 $((255-maskarr[0]))); do
-  	  bytes[0]="$(( i+(iparr[0] & maskarr[0]) ))"
-  	  for j in $(seq 0 $((255-maskarr[1]))); do
-  	    bytes[1]="$(( j+(iparr[1] & maskarr[1]) ))"
-  	    for k in $(seq 0 $((255-maskarr[2]))); do
-  	      bytes[2]="$(( k+(iparr[2] & maskarr[2]) ))"
-  	      for l in $(seq 1 $((255-maskarr[3]))); do
-  	        bytes[3]="$(( l+(iparr[3] & maskarr[3]) ))"
-						printf "%d.%d.%d.%d\n" "${bytes[@]}"
-  	      done
-  	    done
-  	  done
-  	done
-	fi
-}
-# End of Function fncSubnetToIP
+    # Prompt for inputs if not provided via arguments
+    email = args.email or input("Enter your Cloudflare login email: ").strip()
+    api_key = args.api_key or input("Enter your Cloudflare global API key: ").strip()
+    zone = args.zone or input("Enter your Cloudflare zone name (e.g., mydomain.com): ").strip()
+    subdomain = args.subdomain or input("Enter the base subdomain to use (e.g., subdomain.mydomain.com): ").strip()
 
-# Function fncShowProgress
-# Progress bar maker function (based on https://www.baeldung.com/linux/command-line-progress-bar)
-function fncShowProgress {
-	barCharDone="="
-	barCharTodo=" "
-	barSplitter='>'
-	barPercentageScale=2
-  current="$1"
-  total="$2"
+    # Initialize Cloudflare API client to fetch the zone_id
+    try:
+        cf = CloudFlare.CloudFlare(email=email, token=api_key)
+        zones = cf.zones.get(params={"name": zone})
+        if not zones:
+            print(f"Could not find Cloudflare zone '{zone}'. Please check the domain.")
+            logging.error("Cloudflare zone '%s' not found.", zone)
+            sys.exit(1)
+        zone_id = zones[0]["id"]
+        logging.info("Retrieved zone ID '%s' for zone '%s'.", zone_id, zone)
+    except CloudFlare.exceptions.CloudFlareAPIError as e:
+        print(f"Failed to retrieve zone ID: {e}")
+        logging.error("Cloudflare API error while retrieving zone ID: %s", e)
+        sys.exit(1)
 
-  barSize="$(($(tput cols)-70))" # 70 cols for description characters
+    # Save settings to file
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(f"email={email}\n")
+            f.write(f"api_key={api_key}\n")
+            f.write(f"zone_id={zone_id}\n")
+            f.write(f"zone={zone}\n")
+            f.write(f"subdomain={subdomain}\n")
+        # Secure the configuration file by setting file permissions (Unix-based systems)
+        if os.name == 'posix':
+            os.chmod(CONFIG_FILE, 0o600)
+        print(f"Settings initialized and saved to '{CONFIG_FILE}'.")
+        logging.info("Settings saved to '%s'.", CONFIG_FILE)
+    except IOError as e:
+        print(f"Failed to write settings to '{CONFIG_FILE}': {e}")
+        logging.error("IOError while writing settings: %s", e)
+        sys.exit(1)
 
-  # calculate the progress in percentage 
-  percent=$(bc <<< "scale=$barPercentageScale; 100 * $current / $total" )
-  # The number of done and todo characters
-  done=$(bc <<< "scale=0; $barSize * $percent / 100" )
-  todo=$(bc <<< "scale=0; $barSize - $done")
-  # build the done and todo sub-bars
-  doneSubBar=$(printf "%${done}s" | tr " " "${barCharDone}")
-  todoSubBar=$(printf "%${todo}s" | tr " " "${barCharTodo} - 1") # 1 for barSplitter
-  spacesSubBar=$(printf "%${todo}s" | tr " " " ")
+def read_settings():
+    """
+    Read settings from the configuration file.
+    
+    Returns:
+        dict: A dictionary containing the settings.
+    """
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Configuration file '{CONFIG_FILE}' not found. Please initialize settings first using 'iscript'.")
+        logging.error("Configuration file '%s' not found.", CONFIG_FILE)
+        sys.exit(1)
 
-  # output the bar
-  progressBar="| Progress bar of main IPs: [${doneSubBar}${barSplitter}${todoSubBar}] ${percent}%${spacesSubBar}" # Some end space for pretty formatting
-}
-# End of Function showProgress
+    settings = {}
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            for line in f:
+                key, value = line.strip().split('=', 1)
+                settings[key] = value
+        logging.info("Settings read successfully from '%s'.", CONFIG_FILE)
+    except Exception as e:
+        print(f"Error reading configuration: {e}")
+        logging.error("Error reading configuration from '%s': %s", CONFIG_FILE, e)
+        sys.exit(1)
+    return settings
 
-# Function fncCheckIPList
-# Check Subnet
-function fncCheckIPList {
-	local ipList scriptDir resultFile timeoutCommand domainFronting downOK upOK
-	ipList="${1}"
-	resultFile="${3}"
-	scriptDir="${4}"
-	configId="${5}"
-	configHost="${6}"
-	configPort="${7}"
-	configPath="${8}"
-	fileSize="${9}"
-	osVersion="${10}"
-	v2rayCommand="${11}"
-	tryCount="${12}"
-	downThreshold="${13}"
-	upThreshold="${14}"
-	downloadOrUpload="${15}"
-	vpnOrNot="${16}"
-	quickOrNot="${17}"
-	binDir="$scriptDir/../bin"
-	tempConfigDir="$scriptDir/tempConfig"
-	uploadFile="$tempConfigDir/upload_file"
-	configPath=$(echo "$configPath" | sed 's/\//\\\//g')
-	# set proper command for linux
-	if command -v timeout >/dev/null 2>&1; 
-	then
-	    timeoutCommand="timeout"
-	else
-		# set proper command for mac
-		if command -v gtimeout >/dev/null 2>&1; 
-		then
-		    timeoutCommand="gtimeout"
-		else
-		    echo >&2 "I require 'timeout' command but it's not installed. Please install 'timeout' or an alternative command like 'gtimeout' and try again."
-		    exit 1
-		fi
-	fi
-	if [[ "$vpnOrNot" == "YES" ]]
-	then
-		for ip in ${ipList}
-			do
-				if [[  "$downloadOrUpload" == "BOTH" ]]
-				then
-					downOK="NO"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "UP" ]]
-				then
-					downOK="YES"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "DOWN" ]]
-				then
-					downOK="NO"
-					upOK="YES"
-				fi
-				if $timeoutCommand 1 bash -c "</dev/tcp/$ip/443" > /dev/null 2>&1;
-				then
-					if [[ "$quickOrNot" == "NO" ]]
-					then
-						domainFronting=$($timeoutCommand 1 curl -k -s --tlsv1.2 -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=10")
-					elif [[ "$quickOrNot" == "YES" ]]
-					then
-						domainFronting="0000000000"
-					fi
-					if [[ "$domainFronting" == "0000000000" ]]
-					then
-						mainDomain=$(echo "$configHost" | awk -F '.' '{ print $2"."$3}')
-						if [[ "$osVersion" == "Linux" ]]
-								then
-									randomUUID=$(cat /proc/sys/kernel/random/uuid)
-							elif [[ "$osVersion" == "Mac"  ]]
-								then
-									randomUUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-							else
-									echo "OS not supported only Linux or Mac"
-									exit 1
-						fi
-						configServerName="$randomUUID.$mainDomain"
-						ipConfigFile="$tempConfigDir/config.json.$ip"
-						cp "$scriptDir"/config.json.temp "$ipConfigFile"
-						ipO1=$(echo "$ip" | awk -F '.' '{print $1}')
-						ipO2=$(echo "$ip" | awk -F '.' '{print $2}')
-						ipO3=$(echo "$ip" | awk -F '.' '{print $3}')
-						ipO4=$(echo "$ip" | awk -F '.' '{print $4}')
-						port=$((ipO1 + ipO2 + ipO3 + ipO4))
-						if [[ "$osVersion" == "Mac" ]]
-						then
-							sed -i "" "s/IP.IP.IP.IP/$ip/g" "$ipConfigFile"
-							sed -i "" "s/PORTPORT/3$port/g" "$ipConfigFile"
-							sed -i "" "s/IDID/$configId/g" "$ipConfigFile"
-							sed -i "" "s/HOSTHOST/$configHost/g" "$ipConfigFile"
-							sed -i "" "s/CFPORTCFPORT/$configPort/g" "$ipConfigFile"
-							sed -i "" "s/ENDPOINTENDPOINT/$configPath/g" "$ipConfigFile"
-							sed -i "" "s/RANDOMHOST/$configServerName/g" "$ipConfigFile"
-						elif [[ "$osVersion" == "Linux" ]]
-						then
-							sed -i "s/IP.IP.IP.IP/$ip/g" "$ipConfigFile"
-							sed -i "s/PORTPORT/3$port/g" "$ipConfigFile"
-							sed -i "s/IDID/$configId/g" "$ipConfigFile"
-							sed -i "s/HOSTHOST/$configHost/g" "$ipConfigFile"
-							sed -i "s/CFPORTCFPORT/$configPort/g" "$ipConfigFile"
-							sed -i "s/ENDPOINTENDPOINT/$configPath/g" "$ipConfigFile"
-							sed -i "s/RANDOMHOST/$configServerName/g" "$ipConfigFile"
-						fi
-						# shellcheck disable=SC2009
-						pid=$(ps aux | grep config.json."$ip" | grep -v grep | awk '{ print $2 }')
-						if [[ "$pid" ]]
-						then
-							kill -9 "$pid" > /dev/null 2>&1
-						fi
-						downTotalTime=0
-						upTotalTime=0
-						downAvgStr=""
-						upAvgStr=""
-						downSuccessedCount=0
-						upSuccessedCount=0
-						nohup "$binDir"/"$v2rayCommand" -c "$ipConfigFile" > /dev/null &
-						sleep 2
-						for i in $(seq 1 "$tryCount");
-						do
-							downTimeMil=0
-							upTimeMil=0
-							if [[ "$downloadOrUpload" == "DOWN" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								downTimeMil=$($timeoutCommand 2 curl -x "socks5://127.0.0.1:3$port" -s -w "TIME: %{time_total}\n" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=$fileSize" --output /dev/null | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc )
-								if [[ $downTimeMil -gt 100 ]]
-								then
-									downSuccessedCount=$(( downSuccessedCount+1 ))
-								else
-									downTimeMil=0
-								fi
-							fi
-							if [[ "$downloadOrUpload" == "UP" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								result=$($timeoutCommand 2 curl -x "socks5://127.0.0.1:3$port" -s -w "\nTIME: %{time_total}\n" --resolve "speed.cloudflare.com:443:$ip" --data "@$uploadFile" https://speed.cloudflare.com/__up | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc)
-  	            if [[ "$result" ]]
-  	            then
-									upTimeMil="$result"
-									if [[ $upTimeMil -gt 100 ]]
-									then
-										upSuccessedCount=$(( upSuccessedCount+1 ))
-									else
-										upTimeMil=0
-									fi
-  	            fi
-							fi
-							downTotalTime=$(( downTotalTime+downTimeMil ))
-							upTotalTime=$(( upTotalTime+upTimeMil ))
-							downAvgStr="$downAvgStr $downTimeMil"
-							upAvgStr="$upAvgStr $upTimeMil"
-						done
-						if [[ $downSuccessedCount -ge $downThreshold ]] && [[ "$downloadOrUpload" != "UP" ]]
-						then
-							downOK="YES"
-							downRealTime=$(( downTotalTime/downSuccessedCount ))
-						else
-							downRealTime=0
-						fi
-						if [[ $upSuccessedCount -ge $upThreshold ]] && [[ "$downloadOrUpload" != "DOWN" ]]
-						then
-							upOK="YES"
-							upRealTime=$(( upTotalTime/upSuccessedCount ))
-						else
-							upRealTime=0
-						fi
-						# shellcheck disable=SC2009
-						pid=$(ps aux | grep config.json."$ip" | grep -v grep | awk '{ print $2 }')
-						if [[ "$pid" ]]
-						then
-							kill -9 "$pid" > /dev/null 2>&1
-						fi
-						if [[ "$downOK" == "YES" ]] && [[ "$upOK" == "YES" ]]
-						then
-							if [[ "$downRealTime" && $downRealTime -gt 100 ]] || [[ "$upRealTime" && $upRealTime -gt 100 ]]
-							then
-								echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr ${ORANGE}UP: Avg $upRealTime, $upAvgStr${NC}" 
-								if [[ "$downRealTime" && $downRealTime -gt 100 ]]
-								then
-									#echo "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr${NC}" 
-									echo "$downRealTime, $downAvgStr DOWN FOR IP $ip" >> "$resultFile"
-								fi
-								if [[ "$upRealTime" && $upRealTime -gt 100 ]]
-								then
-									#echo "${GREEN}OK${NC} $ip ${BLUE}UP: $upRealTime, $upAvgStr${NC}" 
-									echo "$upRealTime, $upAvgStr UP FOR IP $ip" >> "$resultFile"
-								fi
-							else
-								echo -e "${RED}FAILED${NC} $ip"
-							fi
-						else
-							echo -e "${RED}FAILED${NC} $ip"
-						fi
-					else
-						echo -e "${RED}FAILED${NC} $ip"
-					fi
-				else
-					echo -e "${RED}FAILED${NC} $ip"
-				fi
-		done
-	elif [[ "$vpnOrNot" == "NO" ]]
-	then
-		for ip in ${ipList}
-			do
-				if [[  "$downloadOrUpload" == "BOTH" ]]
-				then
-					downOK="NO"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "UP" ]]
-				then
-					downOK="YES"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "DOWN" ]]
-				then
-					downOK="NO"
-					upOK="YES"
-				fi
-				if $timeoutCommand 1 bash -c "</dev/tcp/$ip/443" > /dev/null 2>&1;
-				then
-					if [[ "$quickOrNot" == "NO" ]]
-					then
-						domainFronting=$($timeoutCommand 1 curl -k -s --tlsv1.2 -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=10")
-					elif [[ "$quickOrNot" == "YES" ]]
-					then
-						domainFronting="0000000000"
-					fi
-					if [[ "$domainFronting" == "0000000000" ]]
-					then
-						downTotalTime=0
-						upTotalTime=0
-						downAvgStr=""
-						upAvgStr=""
-						downSuccessedCount=0
-						upSuccessedCount=0
-						for i in $(seq 1 "$tryCount");
-						do
-							downTimeMil=0
-							upTimeMil=0
-							if [[ "$downloadOrUpload" == "DOWN" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								downTimeMil=$($timeoutCommand 2 curl -s -w "TIME: %{time_total}\n" -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=$fileSize" --output /dev/null | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc )
-								if [[ $downTimeMil -gt 100 ]]
-								then
-									downSuccessedCount=$(( downSuccessedCount+1 ))
-								else
-									downTimeMil=0
-								fi
-							fi
-							if [[ "$downloadOrUpload" == "UP" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								result=$($timeoutCommand 2 curl -s -w "\nTIME: %{time_total}\n" -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" --data "@$uploadFile" https://speed.cloudflare.com/__up | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc)
-  	            if [[ "$result" ]]
-  	            then
-									upTimeMil="$result"
-									if [[ $upTimeMil -gt 100 ]]
-									then
-										upSuccessedCount=$(( upSuccessedCount+1 ))
-									else
-										upTimeMil=0
-									fi
-  	            fi
-							fi
-							downTotalTime=$(( downTotalTime+downTimeMil ))
-							upTotalTime=$(( upTotalTime+upTimeMil ))
-							downAvgStr="$downAvgStr $downTimeMil"
-							upAvgStr="$upAvgStr $upTimeMil"
-						done
-						if [[ $downSuccessedCount -ge $downThreshold ]] && [[ "$downloadOrUpload" != "UP" ]]
-						then
-							downOK="YES"
-							downRealTime=$(( downTotalTime/downSuccessedCount ))
-						else
-							downRealTime=0
-						fi
-						if [[ $upSuccessedCount -ge $upThreshold ]] && [[ "$downloadOrUpload" != "DOWN" ]]
-						then
-							upOK="YES"
-							upRealTime=$(( upTotalTime/upSuccessedCount ))
-						else
-							upRealTime=0
-						fi
-						if [[ "$downOK" == "YES" ]] && [[ "$upOK" == "YES" ]]
-						then
-							if [[ "$downRealTime" && $downRealTime -gt 100 ]] || [[ "$upRealTime" && $upRealTime -gt 100 ]]
-							then
-								echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr ${ORANGE}UP: Avg $upRealTime, $upAvgStr${NC}" 
-								if [[ "$downRealTime" && $downRealTime -gt 100 ]]
-								then
-									#echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr${NC}" 
-									echo "$downRealTime, $downAvgStr DOWN FOR IP $ip" >> "$resultFile"
-								fi
-								if [[ "$upRealTime" && $upRealTime -gt 100 ]]
-								then
-									#echo -e "${GREEN}OK${NC} $ip ${BLUE}UP: $upRealTime, $upAvgStr${NC}" 
-									echo "$upRealTime, $upAvgStr UP FOR IP $ip" >> "$resultFile"
-								fi
-							else
-								echo -e "${RED}FAILED${NC} $ip"
-							fi
-						else
-							echo -e "${RED}FAILED${NC} $ip"
-						fi
-					else
-						echo -e "${RED}FAILED${NC} $ip"
-					fi
-				else
-					echo -e "${RED}FAILED${NC} $ip"
-				fi
-		done
-	fi
-}
-# End of Function fncCheckIPList
-export -f fncCheckIPList
+def read_ips_from_file():
+    """
+    Read IP addresses from the IP file.
+    
+    Returns:
+        list: A list of IP addresses.
+    """
+    if not os.path.exists(IP_FILE):
+        print(f"IP file '{IP_FILE}' not found.")
+        logging.error("IP file '%s' not found.", IP_FILE)
+        sys.exit(1)
 
-# Function fncCheckDpnd
-# Check for dipendencies
-function fncCheckDpnd {
-	osVersion="NULL"
-	if [[ "$(uname)" == "Linux" ]]; then
-	    command -v jq >/dev/null 2>&1 || { echo >&2 "I require 'jq' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-	    command -v parallel >/dev/null 2>&1 || { echo >&2 "I require 'parallel' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-	    command -v bc >/dev/null 2>&1 || { echo >&2 "I require 'bc' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-			command -v timeout >/dev/null 2>&1 || { echo >&2 "I require 'timeout' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-			osVersion="Linux"
-	elif [[ "$(uname)" == "Darwin" ]];then
-	    command -v jq >/dev/null 2>&1 || { echo >&2 "I require 'jq' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-	    command -v parallel >/dev/null 2>&1 || { echo >&2 "I require 'parallel' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-	    command -v bc >/dev/null 2>&1 || { echo >&2 "I require 'bc' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-	    command -v gtimeout >/dev/null 2>&1 || { echo >&2 "I require 'gtimeout' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-			osVersion="Mac"
-	fi
-	echo "$osVersion"
-}
-# End of Function fncCheckDpnd
+    try:
+        with open(IP_FILE, 'r') as file:
+            ips = [line.strip() for line in file if line.strip()]
+        logging.info("Read %d IP address(es) from '%s'.", len(ips), IP_FILE)
+    except Exception as e:
+        print(f"Error reading IP file: {e}")
+        logging.error("Error reading IP file '%s': %s", IP_FILE, e)
+        sys.exit(1)
 
-# Function fncValidateConfig
-# Install packages on destination host
-function fncValidateConfig {
-	local config
-	config="$1"
-	if [[ -f "$config" ]]
-	then
-		echo "reading config ..."
-		configId=$(jq --raw-output .id "$config")	
-		configHost=$(jq --raw-output .host "$config")	
-		configPort=$(jq --raw-output .port "$config")	
-		configPath=$(jq --raw-output .path "$config")	
-		if ! [[ "$configId" ]] || ! [[ $configHost ]] || ! [[ $configPort ]] || ! [[ $configPath ]]
-		then
-			echo "config is not correct"
-			exit 1
-		fi
-	else
-		echo "config file does not exist $config"
-		exit 1
-	fi
-}
-# End of Function fncValidateConfig
+    if not ips:
+        print("No IP addresses found in the IP file.")
+        logging.warning("No IP addresses found in '%s'.", IP_FILE)
+        sys.exit(1)
 
-# Function fncCreateDir
-# creates needed directory
-function fncCreateDir {
-	local dirPath
-	dirPath="${1}"
-	if [ ! -d "$dirPath" ]; then
-		mkdir -p "$dirPath"
-	fi
-}
-# End of Function fncCreateDir
+    return ips
 
-# Function fncMainCFFindSubnet
-# main Function for Subnet
-function fncMainCFFindSubnet {
-	local threads progressBar resultFile scriptDir configId configHost configPort configPath fileSize osVersion parallelVersion subnetsFile breakedSubnets network netmask downloadOrUpload tryCount downThreshold upThreshold vpnOrNot quickOrNot
-	threads="${1}"
-	progressBar="${2}"
-	resultFile="${3}"
-	scriptDir="${4}"
-	configId="${5}"
-	configHost="${6}"
-	configPort="${7}"
-	configPath="${8}"
-	fileSize="${9}"
-	osVersion="${10}"
-	subnetsFile="${11}"
-	tryCount="${12}"
-	downThreshold="${13}"
-	upThreshold="${14}"
-	downloadOrUpload="${15}"
-	vpnOrNot="${16}"
-	quickOrNot="${17}"
+def create_or_update_records():
+    """
+    Create or update A records for each IP address using the Cloudflare API.
+    Also deletes any existing A records not present in the current IP list.
+    """
+    print_header()
+    logging.info("Starting DNS A records creation/update process.")
 
-	if [[ "$osVersion" == "Linux" ]]
-	then
-		v2rayCommand="v2ray"
-	elif [[ "$osVersion" == "Mac"  ]]
-	then
-		v2rayCommand="v2ray-mac"
-	else
-		echo "OS not supported only Linux or Mac"
-		exit 1
-	fi
-	
-	parallelVersion=$(parallel --version | head -n1 | grep -Ewo '[0-9]{8}')
-	defaultSubnetsFileUrl="https://raw.githubusercontent.com/MortezaBashsiz/CFScanner/main/config/cf.local.iplist"
+    settings = read_settings()
+    
+    try:
+        cf = CloudFlare.CloudFlare(email=settings['email'], token=settings['api_key'])
+        logging.info("Initialized Cloudflare API client.")
+    except CloudFlare.exceptions.CloudFlareAPIError as e:
+        print(f"Failed to initialize Cloudflare API client: {e}")
+        logging.error("Cloudflare API client initialization failed: %s", e)
+        sys.exit(1)
 
-	if [[ "$subnetsFile" == "NULL" ]]	
-	then
-		defaultSubnetsFileUrlResult=$(curl -I -L -s "$defaultSubnetsFileUrl" | grep "^HTTP" | grep 200 | awk '{ print $2 }')
-		if [[ "$defaultSubnetsFileUrlResult" == "200" ]]
-		then
-			defaultSubnetsFile=$(curl -s "$defaultSubnetsFileUrl")
-			echo "Reading subnets from $defaultSubnetsFileUrl"
-			cfSubnetList="$defaultSubnetsFile"
-		else
-			echo "URL $defaultSubnetsFileUrl is not available. This URL contains the latest subnet file"
-			echo "Reading subnets from file $scriptDir/../config/cf.local.iplist"
-			cfSubnetList=$(cat "$scriptDir/../config/cf.local.iplist")
-		fi
-	else
-		echo "Reading subnets from file $subnetsFile"
-		cfSubnetList=$(cat "$subnetsFile")
-	fi
-	
-	ipListLength="0"
-	for subNet in ${cfSubnetList}
-	do
-		breakedSubnets=
-		maxSubnet=24
-		network=${subNet%/*}
-		netmask=${subNet#*/}
-		if [[ ${netmask} -ge ${maxSubnet} ]]
-		then
-		  breakedSubnets="${breakedSubnets} ${network}/${netmask}"
-		else
-		  for i in $(seq 0 $(( $(( 2 ** (maxSubnet - netmask) )) - 1 )) )
-		  do
-		    breakedSubnets="${breakedSubnets} $( fncLongIntToStr $(( $( fncIpToLongInt "${network}" ) + $(( 2 ** ( 32 - maxSubnet ) * i )) )) )/${maxSubnet}"
-		  done
-		fi
-		breakedSubnets=$(echo "${breakedSubnets}"|tr ' ' '\n')
-		for breakedSubnet in ${breakedSubnets}
-		do
-			ipListLength=$(( ipListLength+1 ))
-		done
-	done
+    zone_id = settings['zone_id']
+    base_subdomain = settings['subdomain']
 
-	passedIpsCount=0
-	for subNet in ${cfSubnetList}
-	do
-		breakedSubnets=
-		maxSubnet=24
-		network=${subNet%/*}
-		netmask=${subNet#*/}
-		if [[ ${netmask} -ge ${maxSubnet} ]]
-		then
-		  breakedSubnets="${breakedSubnets} ${network}/${netmask}"
-		else
-		  for i in $(seq 0 $(( $(( 2 ** (maxSubnet - netmask) )) - 1 )) )
-		  do
-		    breakedSubnets="${breakedSubnets} $( fncLongIntToStr $(( $( fncIpToLongInt "${network}" ) + $(( 2 ** ( 32 - maxSubnet ) * i )) )) )/${maxSubnet}"
-		  done
-		fi
-		breakedSubnets=$(echo "${breakedSubnets}"|tr ' ' '\n')
-		for breakedSubnet in ${breakedSubnets}
-		do
-			fncShowProgress "$passedIpsCount" "$ipListLength"
-			killall v2ray > /dev/null 2>&1
-			ipList=$(fncSubnetToIP "$breakedSubnet")
-	  	tput cuu1; tput ed # rewrites Parallel's bar
-	  	if [[ $parallelVersion -gt 20220515 ]];
-	  	then
-	  	  parallel --ll --bar -j "$threads" fncCheckIPList ::: "$ipList" ::: "$progressBar" ::: "$resultFile" ::: "$scriptDir" ::: "$configId" ::: "$configHost" ::: "$configPort" ::: "$configPath" ::: "$fileSize" ::: "$osVersion" ::: "$v2rayCommand" ::: "$tryCount" ::: "$downThreshold" ::: "$upThreshold" ::: "$downloadOrUpload" ::: "$vpnOrNot" ::: "$quickOrNot"
-	  	else
-	  	  echo -e "${RED}$progressBar${NC}"
-	  	  parallel -j "$threads" fncCheckIPList ::: "$ipList" ::: "$progressBar" ::: "$resultFile" ::: "$scriptDir" ::: "$configId" ::: "$configHost" ::: "$configPort" ::: "$configPath" ::: "$fileSize" ::: "$osVersion" ::: "$v2rayCommand" ::: "$tryCount" ::: "$downThreshold" ::: "$upThreshold" ::: "$downloadOrUpload" ::: "$vpnOrNot" ::: "$quickOrNot"
-	  	fi
-			killall v2ray > /dev/null 2>&1
-			passedIpsCount=$(( passedIpsCount+1 ))
-		done
-	done
-	sort -n -k1 -t, "$resultFile" -o "$resultFile"
-}
-# End of Function fncMainCFFindSubnet
+    desired_ips = read_ips_from_file()
+    num_ips = len(desired_ips)
+    print(f"Found {num_ips} IP address(es) in '{IP_FILE}'.")
+    logging.info("Processing %d IP address(es).", num_ips)
 
-# Function fncMainCFFindIP
-# main Function for IP
-function fncMainCFFindIP {
-	local threads progressBar resultFile scriptDir configId configHost configPort configPath fileSize osVersion parallelVersion IPFile downloadOrUpload downThreshold upThreshold vpnOrNot quickOrNot
-	threads="${1}"
-	progressBar="${2}"
-	resultFile="${3}"
-	scriptDir="${4}"
-	configId="${5}"
-	configHost="${6}"
-	configPort="${7}"
-	configPath="${8}"
-	fileSize="${9}"
-	osVersion="${10}"
-	IPFile="${11}"
-	tryCount="${12}"
-	downThreshold="${13}" 
-	upThreshold="${14}"
-	downloadOrUpload="${15}"
-	vpnOrNot="${16}"
-	quickOrNot="${17}"
+    # Fetch existing DNS records for the subdomain
+    try:
+        existing_records = cf.zones.dns_records.get(
+            zone_id, 
+            params={"name": base_subdomain, "type": "A"}
+        )
+        existing_ips = {record['content']: record['id'] for record in existing_records}
+        logging.info("Fetched existing DNS A records for '%s'.", base_subdomain)
+    except CloudFlare.exceptions.CloudFlareAPIError as e:
+        print(f"Error fetching existing DNS records: {e}")
+        logging.error("Error fetching existing DNS records: %s", e)
+        sys.exit(1)
 
-	if [[ "$osVersion" == "Linux" ]]
-	then
-		v2rayCommand="v2ray"
-	elif [[ "$osVersion" == "Mac"  ]]
-	then
-		v2rayCommand="v2ray-mac"
-	else
-		echo "OS not supported only Linux or Mac"
-		exit 1
-	fi
+    desired_ips_set = set(desired_ips)
+    existing_ips_set = set(existing_ips.keys())
 
-	parallelVersion=$(parallel --version | head -n1 | grep -Ewo '[0-9]{8}')
+    # Determine records to create, keep, or delete
+    ips_to_create = desired_ips_set - existing_ips_set
+    ips_to_delete = existing_ips_set - desired_ips_set
+    ips_to_keep = desired_ips_set & existing_ips_set
 
-	cfIPList=$(cat "$IPFile")
-	killall v2ray > /dev/null 2>&1
-	tput cuu1; tput ed # rewrites Parallel's bar
-	if [[ $parallelVersion -gt 20220515 ]];
-	then
-	  parallel --ll --bar -j "$threads" fncCheckIPList ::: "$cfIPList" ::: "$progressBar" ::: "$resultFile" ::: "$scriptDir" ::: "$configId" ::: "$configHost" ::: "$configPort" ::: "$configPath" ::: "$fileSize" ::: "$osVersion" ::: "$v2rayCommand" ::: "$tryCount" ::: "$downThreshold" ::: "$upThreshold" ::: "$downloadOrUpload" ::: "$vpnOrNot" ::: "$quickOrNot"
-	else
-	  echo -e "${RED}$progressBar${NC}"
-	  parallel -j "$threads" fncCheckIPList ::: "$cfIPList" ::: "$progressBar" ::: "$resultFile" ::: "$scriptDir" ::: "$configId" ::: "$configHost" ::: "$configPort" ::: "$configPath" ::: "$fileSize" ::: "$osVersion" ::: "$v2rayCommand" ::: "$tryCount" ::: "$downThreshold" ::: "$upThreshold" ::: "$downloadOrUpload" ::: "$vpnOrNot" ::: "$quickOrNot"
-	fi
-	killall v2ray > /dev/null 2>&1
-	sort -n -k1 -t, "$resultFile" -o "$resultFile"
-}
-# End of Function fncMainCFFindIP
+    # Create new A records
+    for ip_address in ips_to_create:
+        print(f"Creating A record for '{base_subdomain}' with IP '{ip_address}'...")
+        logging.info("Creating A record: %s -> %s", base_subdomain, ip_address)
 
-clientConfigFile="https://raw.githubusercontent.com/MortezaBashsiz/CFScanner/main/config/ClientConfig.json"
-subnetIPFile="NULL"
+        a_record = {
+            "type": "A",
+            "name": base_subdomain,
+            "ttl": 60,  # TTL of 1 minute
+            "content": ip_address,
+            "proxied": False  # Set to True if you want Cloudflare's proxy features
+        }
 
-# Function fncUsage
-# usage function
-function fncUsage {
-	if [[ "$osVersion" == "Mac" ]]
-	then 
-		echo -e "Usage: cfScanner [ -v YES/NO ]
-			[ -m SUBNET/IP ] 
-			[ -t DOWN/UP/BOTH ]
-			[ -p <int> ] threads
-			[ -n <int> ] trycount
-			[ -c <configfile> ]
-			[ -s <int> ] speed
-			[ -r <int> ] randomness
-			[ -d <int> ] download threshold
-			[ -u <int> ] upload threshold
-			[ -f <custome-ip-file> (if you chose IP mode)]
-			[ -q YES/NO]
-			[ -h ] help\n"
-		exit 2
-	elif [[ "$osVersion" == "Linux" ]]
-	then
-		echo -e "Usage: cfScanner [ -v|--vpn-mode YES/NO ]
-			[ -m|--mode  SUBNET/IP ] 
-			[ -t|--test-type  DOWN/UP/BOTH ]
-			[ -p|--thread <int> ]
-			[ -n|--tryCount <int> ]
-			[ -c|--config <configfile> ]
-			[ -s|--speed <int> ] 
-			[ -r|--random <int> ]
-			[ -d|--down-threshold <int> ]
-			[ -u|--up-threshold <int> ]
-			[ -f|--file <custome-ip-file> (if you chose IP mode)]
-			[ -q|--quick YES/NO]
-			[ -h|--help ]\n"
-		 exit 2
-	fi
-}
-# End of Function fncUsage
+        try:
+            cf.zones.dns_records.post(zone_id, data=a_record)
+            print(f"Successfully created A record: {base_subdomain} -> {ip_address}")
+            logging.info("Successfully created A record: %s -> %s", base_subdomain, ip_address)
+            time.sleep(0.2)  # Sleep for 200ms to respect rate limits
+        except CloudFlare.exceptions.CloudFlareAPIError as e:
+            print(f"Error creating A record for '{base_subdomain}': {e}")
+            logging.error("Error creating A record for '%s': %s", base_subdomain, e)
 
-randomNumber="NULL"
-downThreshold="1"
-upThreshold="1"
-osVersion="$(fncCheckDpnd)"
-vpnOrNot="NO"
-subnetOrIP="SUBNET"
-downloadOrUpload="BOTH"
-threads="4"
-tryCount="1"
-config="NULL"
-speed="100"
-quickOrNot="NO"
+    # Delete obsolete A records
+    for ip_address in ips_to_delete:
+        record_id = existing_records[[rec['content'] for rec in existing_records].index(ip_address)]['id']
+        print(f"Deleting obsolete A record for '{base_subdomain}' with IP '{ip_address}'...")
+        logging.info("Deleting A record: %s -> %s", base_subdomain, ip_address)
+        try:
+            cf.zones.dns_records.delete(zone_id, record_id)
+            print(f"Successfully deleted A record: {base_subdomain} -> {ip_address}")
+            logging.info("Successfully deleted A record: %s -> %s", base_subdomain, ip_address)
+            time.sleep(0.2)  # Sleep for 200ms to respect rate limits
+        except CloudFlare.exceptions.CloudFlareAPIError as e:
+            print(f"Error deleting A record for '{base_subdomain}': {e}")
+            logging.error("Error deleting A record for '%s': %s", base_subdomain, e)
 
-if [[ "$osVersion" == "Mac" ]]
-then
-	parsedArguments=$(getopt v:m:t:p:n:c:s:r:d:u:f:q:h "$@")
-elif [[ "$osVersion" == "Linux" ]]
-then
-	parsedArguments=$(getopt -a -n cfScanner -o v:m:t:p:n:c:s:r:d:u:f:q:h --long vpn-mode:,mode:,test-type:,thread:,tryCount:,config:,speed:,random:,down-threshold:,up-threshold:,file:,quick:,help -- "$@")
-fi
+    # Optionally, update TTL or proxied status for existing records (if needed)
+    # Uncomment and modify the following section if you want to enforce specific TTL or proxied settings
 
-eval set -- "$parsedArguments"
-if [[ "$osVersion" == "Mac" ]]
-then
-	while :
-	do
-		case "$1" in
-			-v) vpnOrNot="$2" ; shift 2 ;;
-			-m) subnetOrIP="$2" ; shift 2 ;;
-			-t) downloadOrUpload="$2" ; shift 2 ;;
-			-p) threads="$2" ; shift 2 ;;
-			-n) tryCount="$2" ; shift 2 ;;
-			-c) config="$2" ; shift 2 ;;
-			-s) speed="$2" ; shift 2 ;;
-			-r) randomNumber="$2" ; shift 2 ;;
-			-d) downThreshold="$2" ; shift 2 ;;
-			-u) upThreshold="$2" ; shift 2 ;;
-			-f) subnetIPFile="$2" ; shift 2 ;;
-			-q) quickOrNot="$2" ; shift 2 ;;
-			-h) fncUsage ;;
-			--) shift; break ;;
-			*) echo "Unexpected option: $1 is not acceptable"
-			fncUsage ;;
-		esac
-	done
-elif [[ "$osVersion" == "Linux" ]]
-then
-	while :
-	do
-		case "$1" in
-			-v|--vpn-mode) vpnOrNot="$2" ; shift 2 ;;
-			-m|--mode) subnetOrIP="$2" ; shift 2 ;;
-			-t|--test-type) downloadOrUpload="$2" ; shift 2 ;;
-			-p|--thread) threads="$2" ; shift 2 ;;
-			-n|--tryCount) tryCount="$2" ; shift 2 ;;
-			-c|--config) config="$2" ; shift 2 ;;
-			-s|--speed) speed="$2" ; shift 2 ;;
-			-r|--random) randomNumber="$2" ; shift 2 ;;
-			-d|--down-threshold) downThreshold="$2" ; shift 2 ;;
-			-u|--up-threshold) upThreshold="$2" ; shift 2 ;;
-			-f|--file) subnetIPFile="$2" ; shift 2 ;;
-			-q|--quick) quickOrNot="$2" ; shift 2 ;;
-			-h|--help) fncUsage ;;
-			--) shift; break ;;
-			*) echo "Unexpected option: $1 is not acceptable"
-			fncUsage ;;
-		esac
-	done
-fi
+    # for ip_address in ips_to_keep:
+    #     record_id = existing_records[[rec['content'] for rec in existing_records].index(ip_address)]['id']
+    #     updated_record = {
+    #         "ttl": 60,
+    #         "proxied": False
+    #     }
+    #     try:
+    #         cf.zones.dns_records.put(zone_id, record_id, data=updated_record)
+    #         logging.info("Updated A record settings for %s -> %s", base_subdomain, ip_address)
+    #     except CloudFlare.exceptions.CloudFlareAPIError as e:
+    #         print(f"Error updating A record for '{base_subdomain}': {e}")
+    #         logging.error("Error updating A record for '%s': %s", base_subdomain, e)
 
-validArguments=$?
-if [ "$validArguments" != "0" ]; then
-  echo "error validate"
-  exit 2
-fi
+    print("DNS A records update process completed.")
+    logging.info("DNS A records update process completed.")
 
-if [[ "$vpnOrNot" != "YES" && "$vpnOrNot" != "NO" ]] 
-then
-	echo "Wrong value: $vpnOrNot Must be YES or NO"
-	exit 2
-fi
-if [[ "$subnetOrIP" != "SUBNET" && "$subnetOrIP" != "IP" ]] 
-then
-	echo "Wrong value: $subnetOrIP Must be SUBNET or IP"
-	exit 2
-fi
-if [[ "$downloadOrUpload" != "DOWN" && "$downloadOrUpload" != "UP" && "$downloadOrUpload" != "BOTH" ]] 
-then
-	echo "Wrong value: $downloadOrUpload Must be DOWN or UP or BOTH"
-	exit 2
-fi
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Cloudflare DNS A Record Updater")
+    parser.add_argument("action", choices=["iscript", "rscript"], help="Specify 'iscript' to initialize settings or 'rscript' to run the script")
+    args = parser.parse_args()
 
-if [[ "$subnetIPFile" != "NULL" ]]
-then
-	if ! [[ -f "$subnetIPFile" ]]
-	then
-		echo "file does not exists: $subnetIPFile"
-		exit 1
-	fi
-fi
-
-now=$(date +"%Y%m%d-%H%M%S")
-scriptDir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-resultDir="$scriptDir/result"
-resultFile="$resultDir/$now-result.cf"
-tempConfigDir="$scriptDir/tempConfig"
-filesDir="$tempConfigDir"
-
-uploadFile="$filesDir/upload_file"
-
-configId="NULL"
-configHost="NULL"
-configPort="NULL"
-configPath="NULL"
-
-progressBar=""
-
-export GREEN='\033[0;32m'
-export BLUE='\033[0;34m'
-export RED='\033[0;31m'
-export ORANGE='\033[0;33m'
-export YELLOW='\033[1;33m'
-export NC='\033[0m'
-
-fncCreateDir "${resultDir}"
-fncCreateDir "${tempConfigDir}"
-echo "" > "$resultFile"
-
-if [[ "$config" == "NULL"  ]]
-then
-	echo "updating config"
-	configRealUrlResult=$(curl -I -L -s "$clientConfigFile" | grep "^HTTP" | grep 200 | awk '{ print $2 }')
-	if [[ "$configRealUrlResult" == "200" ]]
-	then
-		curl -s "$clientConfigFile" -o "$scriptDir"/config.default
-		echo "config.default updated with $clientConfigFile"
-		echo ""
-		config="$scriptDir/config.default"
-		cat "$config"
-	else
-		echo ""
-		echo "config file is not available $clientConfigFile"
-		echo "use your own"
-		echo ""	
-		exit 1
-	fi
-else
-	echo ""
-	echo "using your own config $config"
-	cat "$config"
-	echo ""
-fi
-
-fileSize="$(( 2*speed*1024 ))"
-if [[ "$downloadOrUpload" == "DOWN" || "$downloadOrUpload" == "BOTH" ]]
-then
-	echo "You are testing download"
-fi
-if [[ "$downloadOrUpload" == "UP" || "$downloadOrUpload" == "BOTH" ]]
-then
-	echo "You are testing upload"
-	echo "making upload file by size $fileSize Bytes in $uploadFile"
-	ddSize="$(( 2*speed ))"
-	dd if=/dev/random of="$uploadFile" bs=1024 count="$ddSize" > /dev/null 2>&1
-fi
-
-fncValidateConfig "$config"
-
-if [[ "$subnetOrIP" == "SUBNET" ]]
-then
-	fncMainCFFindSubnet	"$threads" "$progressBar" "$resultFile" "$scriptDir" "$configId" "$configHost" "$configPort" "$configPath" "$fileSize" "$osVersion" "$subnetIPFile" "$tryCount" "$downThreshold" "$upThreshold" "$downloadOrUpload" "$vpnOrNot" "$quickOrNot"
-elif [[ "$subnetOrIP" == "IP" ]]
-then
-	fncMainCFFindIP	"$threads" "$progressBar" "$resultFile" "$scriptDir" "$configId" "$configHost" "$configPort" "$configPath" "$fileSize" "$osVersion" "$subnetIPFile" "$tryCount" "$downThreshold" "$upThreshold" "$downloadOrUpload" "$vpnOrNot" "$quickOrNot"
-else
-	echo "$subnetOrIP is not correct choose one SUBNET or IP"
-	exit 1
-fi
+    if args.action == "iscript":
+        init_settings()
+    elif args.action == "rscript":
+        create_or_update_records()
