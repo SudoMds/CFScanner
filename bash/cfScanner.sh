@@ -16,7 +16,8 @@
 #===============================================================================
 
 export TOP_PID=$$
-
+# Global variable to define how many clean IPs are needed
+CLEAN_IPS_NEEDED=5
 # Function fncLongIntToStr
 # converts IP in long integer format to a string 
 fncLongIntToStr() {
@@ -164,8 +165,11 @@ function fncShowProgress {
 
 # Function fncCheckIPList
 # Check Subnet
+
+
+# Function fncCheckIPList with early stopping once the required number of clean IPs is found
 function fncCheckIPList {
-	local ipList scriptDir resultFile timeoutCommand domainFronting downOK upOK
+	local ipList scriptDir resultFile timeoutCommand domainFronting downOK upOK foundIPsCount
 	ipList="${1}"
 	resultFile="${3}"
 	scriptDir="${4}"
@@ -186,173 +190,110 @@ function fncCheckIPList {
 	tempConfigDir="$scriptDir/tempConfig"
 	uploadFile="$tempConfigDir/upload_file"
 	configPath=$(echo "$configPath" | sed 's/\//\\\//g')
-	# set proper command for linux
-	if command -v timeout >/dev/null 2>&1; 
-	then
+	foundIPsCount=0  # Counter for clean IPs found
+
+	# Set proper command for Linux or Mac
+	if command -v timeout >/dev/null 2>&1; then
 	    timeoutCommand="timeout"
+	elif command -v gtimeout >/dev/null 2>&1; then
+	    timeoutCommand="gtimeout"
 	else
-		# set proper command for mac
-		if command -v gtimeout >/dev/null 2>&1; 
-		then
-		    timeoutCommand="gtimeout"
-		else
-		    echo >&2 "I require 'timeout' command but it's not installed. Please install 'timeout' or an alternative command like 'gtimeout' and try again."
-		    exit 1
-		fi
+	    echo >&2 "I require 'timeout' or 'gtimeout' but it's not installed. Exiting..."
+	    exit 1
 	fi
-	if [[ "$vpnOrNot" == "YES" ]]
-	then
-		for ip in ${ipList}
-			do
-				if [[  "$downloadOrUpload" == "BOTH" ]]
-				then
-					downOK="NO"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "UP" ]]
-				then
-					downOK="YES"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "DOWN" ]]
-				then
-					downOK="NO"
-					upOK="YES"
+
+	if [[ "$vpnOrNot" == "YES" ]]; then
+		for ip in ${ipList}; do
+			if [[ "$downloadOrUpload" == "BOTH" ]]; then
+				downOK="NO"
+				upOK="NO"
+			elif [[ "$downloadOrUpload" == "UP" ]]; then
+				downOK="YES"
+				upOK="NO"
+			elif [[ "$downloadOrUpload" == "DOWN" ]]; then
+				downOK="NO"
+				upOK="YES"
+			fi
+
+			# Check if port 443 is open
+			if $timeoutCommand 1 bash -c "</dev/tcp/$ip/443" > /dev/null 2>&1; then
+				if [[ "$quickOrNot" == "NO" ]]; then
+					domainFronting=$($timeoutCommand 1 curl -k -s --tlsv1.2 -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=10")
+				elif [[ "$quickOrNot" == "YES" ]]; then
+					domainFronting="0000000000"
 				fi
-				if $timeoutCommand 1 bash -c "</dev/tcp/$ip/443" > /dev/null 2>&1;
-				then
-					if [[ "$quickOrNot" == "NO" ]]
-					then
-						domainFronting=$($timeoutCommand 1 curl -k -s --tlsv1.2 -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=10")
-					elif [[ "$quickOrNot" == "YES" ]]
-					then
-						domainFronting="0000000000"
-					fi
-					if [[ "$domainFronting" == "0000000000" ]]
-					then
-						mainDomain=$(echo "$configHost" | awk -F '.' '{ print $2"."$3}')
-						if [[ "$osVersion" == "Linux" ]]
-								then
-									randomUUID=$(cat /proc/sys/kernel/random/uuid)
-							elif [[ "$osVersion" == "Mac"  ]]
-								then
-									randomUUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+				if [[ "$domainFronting" == "0000000000" ]]; then
+					mainDomain=$(echo "$configHost" | awk -F '.' '{ print $2"."$3}')
+					randomUUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+					configServerName="$randomUUID.$mainDomain"
+					ipConfigFile="$tempConfigDir/config.json.$ip"
+					cp "$scriptDir"/config.json.temp "$ipConfigFile"
+					
+					ipO1=$(echo "$ip" | awk -F '.' '{print $1}')
+					ipO2=$(echo "$ip" | awk -F '.' '{print $2}')
+					ipO3=$(echo "$ip" | awk -F '.' '{print $3}')
+					ipO4=$(echo "$ip" | awk -F '.' '{print $4}')
+					port=$((ipO1 + ipO2 + ipO3 + ipO4))
+
+					# Update configuration with IP and port
+					sed -i "s/IP.IP.IP.IP/$ip/g" "$ipConfigFile"
+					sed -i "s/PORTPORT/3$port/g" "$ipConfigFile"
+					sed -i "s/IDID/$configId/g" "$ipConfigFile"
+					sed -i "s/HOSTHOST/$configHost/g" "$ipConfigFile"
+					sed -i "s/CFPORTCFPORT/$configPort/g" "$ipConfigFile"
+					sed -i "s/ENDPOINTENDPOINT/$configPath/g" "$ipConfigFile"
+					sed -i "s/RANDOMHOST/$configServerName/g" "$ipConfigFile"
+
+					downTotalTime=0
+					upTotalTime=0
+					downAvgStr=""
+					upAvgStr=""
+					downSuccessedCount=0
+					upSuccessedCount=0
+
+					nohup "$binDir"/"$v2rayCommand" -c "$ipConfigFile" > /dev/null &
+					sleep 2
+
+					# Run the download/upload tests
+					for i in $(seq 1 "$tryCount"); do
+						downTimeMil=0
+						upTimeMil=0
+						if [[ "$downloadOrUpload" == "DOWN" ]] || [[ "$downloadOrUpload" == "BOTH" ]]; then
+							downTimeMil=$($timeoutCommand 2 curl -x "socks5://127.0.0.1:3$port" -s -w "TIME: %{time_total}\n" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=$fileSize" --output /dev/null | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc)
+							if [[ $downTimeMil -gt 100 ]]; then
+								downSuccessedCount=$(( downSuccessedCount+1 ))
 							else
-									echo "OS not supported only Linux or Mac"
-									exit 1
-						fi
-						configServerName="$randomUUID.$mainDomain"
-						ipConfigFile="$tempConfigDir/config.json.$ip"
-						cp "$scriptDir"/config.json.temp "$ipConfigFile"
-						ipO1=$(echo "$ip" | awk -F '.' '{print $1}')
-						ipO2=$(echo "$ip" | awk -F '.' '{print $2}')
-						ipO3=$(echo "$ip" | awk -F '.' '{print $3}')
-						ipO4=$(echo "$ip" | awk -F '.' '{print $4}')
-						port=$((ipO1 + ipO2 + ipO3 + ipO4))
-						if [[ "$osVersion" == "Mac" ]]
-						then
-							sed -i "" "s/IP.IP.IP.IP/$ip/g" "$ipConfigFile"
-							sed -i "" "s/PORTPORT/3$port/g" "$ipConfigFile"
-							sed -i "" "s/IDID/$configId/g" "$ipConfigFile"
-							sed -i "" "s/HOSTHOST/$configHost/g" "$ipConfigFile"
-							sed -i "" "s/CFPORTCFPORT/$configPort/g" "$ipConfigFile"
-							sed -i "" "s/ENDPOINTENDPOINT/$configPath/g" "$ipConfigFile"
-							sed -i "" "s/RANDOMHOST/$configServerName/g" "$ipConfigFile"
-						elif [[ "$osVersion" == "Linux" ]]
-						then
-							sed -i "s/IP.IP.IP.IP/$ip/g" "$ipConfigFile"
-							sed -i "s/PORTPORT/3$port/g" "$ipConfigFile"
-							sed -i "s/IDID/$configId/g" "$ipConfigFile"
-							sed -i "s/HOSTHOST/$configHost/g" "$ipConfigFile"
-							sed -i "s/CFPORTCFPORT/$configPort/g" "$ipConfigFile"
-							sed -i "s/ENDPOINTENDPOINT/$configPath/g" "$ipConfigFile"
-							sed -i "s/RANDOMHOST/$configServerName/g" "$ipConfigFile"
-						fi
-						# shellcheck disable=SC2009
-						pid=$(ps aux | grep config.json."$ip" | grep -v grep | awk '{ print $2 }')
-						if [[ "$pid" ]]
-						then
-							kill -9 "$pid" > /dev/null 2>&1
-						fi
-						downTotalTime=0
-						upTotalTime=0
-						downAvgStr=""
-						upAvgStr=""
-						downSuccessedCount=0
-						upSuccessedCount=0
-						nohup "$binDir"/"$v2rayCommand" -c "$ipConfigFile" > /dev/null &
-						sleep 2
-						for i in $(seq 1 "$tryCount");
-						do
-							downTimeMil=0
-							upTimeMil=0
-							if [[ "$downloadOrUpload" == "DOWN" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								downTimeMil=$($timeoutCommand 2 curl -x "socks5://127.0.0.1:3$port" -s -w "TIME: %{time_total}\n" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=$fileSize" --output /dev/null | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc )
-								if [[ $downTimeMil -gt 100 ]]
-								then
-									downSuccessedCount=$(( downSuccessedCount+1 ))
-								else
-									downTimeMil=0
-								fi
+								downTimeMil=0
 							fi
-							if [[ "$downloadOrUpload" == "UP" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								result=$($timeoutCommand 2 curl -x "socks5://127.0.0.1:3$port" -s -w "\nTIME: %{time_total}\n" --resolve "speed.cloudflare.com:443:$ip" --data "@$uploadFile" https://speed.cloudflare.com/__up | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc)
-  	            if [[ "$result" ]]
-  	            then
-									upTimeMil="$result"
-									if [[ $upTimeMil -gt 100 ]]
-									then
-										upSuccessedCount=$(( upSuccessedCount+1 ))
-									else
-										upTimeMil=0
-									fi
-  	            fi
-							fi
-							downTotalTime=$(( downTotalTime+downTimeMil ))
-							upTotalTime=$(( upTotalTime+upTimeMil ))
-							downAvgStr="$downAvgStr $downTimeMil"
-							upAvgStr="$upAvgStr $upTimeMil"
-						done
-						if [[ $downSuccessedCount -ge $downThreshold ]] && [[ "$downloadOrUpload" != "UP" ]]
-						then
-							downOK="YES"
-							downRealTime=$(( downTotalTime/downSuccessedCount ))
-						else
-							downRealTime=0
 						fi
-						if [[ $upSuccessedCount -ge $upThreshold ]] && [[ "$downloadOrUpload" != "DOWN" ]]
-						then
-							upOK="YES"
-							upRealTime=$(( upTotalTime/upSuccessedCount ))
-						else
-							upRealTime=0
-						fi
-						# shellcheck disable=SC2009
-						pid=$(ps aux | grep config.json."$ip" | grep -v grep | awk '{ print $2 }')
-						if [[ "$pid" ]]
-						then
-							kill -9 "$pid" > /dev/null 2>&1
-						fi
-						if [[ "$downOK" == "YES" ]] && [[ "$upOK" == "YES" ]]
-						then
-							if [[ "$downRealTime" && $downRealTime -gt 100 ]] || [[ "$upRealTime" && $upRealTime -gt 100 ]]
-							then
-								echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr ${ORANGE}UP: Avg $upRealTime, $upAvgStr${NC}" 
-								if [[ "$downRealTime" && $downRealTime -gt 100 ]]
-								then
-									#echo "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr${NC}" 
-									echo "$downRealTime, $downAvgStr DOWN FOR IP $ip" >> "$resultFile"
-								fi
-								if [[ "$upRealTime" && $upRealTime -gt 100 ]]
-								then
-									#echo "${GREEN}OK${NC} $ip ${BLUE}UP: $upRealTime, $upAvgStr${NC}" 
-									echo "$upRealTime, $upAvgStr UP FOR IP $ip" >> "$resultFile"
-								fi
+						if [[ "$downloadOrUpload" == "UP" ]] || [[ "$downloadOrUpload" == "BOTH" ]]; then
+							upTimeMil=$($timeoutCommand 2 curl -x "socks5://127.0.0.1:3$port" -s -w "TIME: %{time_total}\n" --resolve "speed.cloudflare.com:443:$ip" --data "@$uploadFile" https://speed.cloudflare.com/__up | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc)
+							if [[ $upTimeMil -gt 100 ]]; then
+								upSuccessedCount=$(( upSuccessedCount+1 ))
 							else
-								echo -e "${RED}FAILED${NC} $ip"
+								upTimeMil=0
 							fi
-						else
-							echo -e "${RED}FAILED${NC} $ip"
+						fi
+						downTotalTime=$(( downTotalTime + downTimeMil ))
+						upTotalTime=$(( upTotalTime + upTimeMil ))
+						downAvgStr="$downAvgStr $downTimeMil"
+						upAvgStr="$upAvgStr $upTimeMil"
+					done
+
+					downRealTime=$(( downTotalTime / downSuccessedCount ))
+					upRealTime=$(( upTotalTime / upSuccessedCount ))
+
+					if [[ "$downOK" == "YES" ]] && [[ "$upOK" == "YES" ]]; then
+						echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr ${ORANGE}UP: Avg $upRealTime, $upAvgStr${NC}"
+						echo "$downRealTime, $downAvgStr DOWN FOR IP $ip" >> "$resultFile"
+						echo "$upRealTime, $upAvgStr UP FOR IP $ip" >> "$resultFile"
+						
+						# Increment the counter when a clean IP is found
+						foundIPsCount=$((foundIPsCount + 1))
+						if [[ "$foundIPsCount" -ge "$CLEAN_IPS_NEEDED" ]]; then
+							echo "Found $CLEAN_IPS_NEEDED clean IPs. Stopping..."
+							break
 						fi
 					else
 						echo -e "${RED}FAILED${NC} $ip"
@@ -360,119 +301,12 @@ function fncCheckIPList {
 				else
 					echo -e "${RED}FAILED${NC} $ip"
 				fi
-		done
-	elif [[ "$vpnOrNot" == "NO" ]]
-	then
-		for ip in ${ipList}
-			do
-				if [[  "$downloadOrUpload" == "BOTH" ]]
-				then
-					downOK="NO"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "UP" ]]
-				then
-					downOK="YES"
-					upOK="NO"
-				elif [[ "$downloadOrUpload" == "DOWN" ]]
-				then
-					downOK="NO"
-					upOK="YES"
-				fi
-				if $timeoutCommand 1 bash -c "</dev/tcp/$ip/443" > /dev/null 2>&1;
-				then
-					if [[ "$quickOrNot" == "NO" ]]
-					then
-						domainFronting=$($timeoutCommand 1 curl -k -s --tlsv1.2 -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=10")
-					elif [[ "$quickOrNot" == "YES" ]]
-					then
-						domainFronting="0000000000"
-					fi
-					if [[ "$domainFronting" == "0000000000" ]]
-					then
-						downTotalTime=0
-						upTotalTime=0
-						downAvgStr=""
-						upAvgStr=""
-						downSuccessedCount=0
-						upSuccessedCount=0
-						for i in $(seq 1 "$tryCount");
-						do
-							downTimeMil=0
-							upTimeMil=0
-							if [[ "$downloadOrUpload" == "DOWN" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								downTimeMil=$($timeoutCommand 2 curl -s -w "TIME: %{time_total}\n" -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" "https://speed.cloudflare.com/__down?bytes=$fileSize" --output /dev/null | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc )
-								if [[ $downTimeMil -gt 100 ]]
-								then
-									downSuccessedCount=$(( downSuccessedCount+1 ))
-								else
-									downTimeMil=0
-								fi
-							fi
-							if [[ "$downloadOrUpload" == "UP" ]] || [[  "$downloadOrUpload" == "BOTH" ]]
-							then
-								result=$($timeoutCommand 2 curl -s -w "\nTIME: %{time_total}\n" -H "Host: speed.cloudflare.com" --resolve "speed.cloudflare.com:443:$ip" --data "@$uploadFile" https://speed.cloudflare.com/__up | grep "TIME" | tail -n 1 | awk '{print $2}' | xargs -I {} echo "{} * 1000 /1" | bc)
-  	            if [[ "$result" ]]
-  	            then
-									upTimeMil="$result"
-									if [[ $upTimeMil -gt 100 ]]
-									then
-										upSuccessedCount=$(( upSuccessedCount+1 ))
-									else
-										upTimeMil=0
-									fi
-  	            fi
-							fi
-							downTotalTime=$(( downTotalTime+downTimeMil ))
-							upTotalTime=$(( upTotalTime+upTimeMil ))
-							downAvgStr="$downAvgStr $downTimeMil"
-							upAvgStr="$upAvgStr $upTimeMil"
-						done
-						if [[ $downSuccessedCount -ge $downThreshold ]] && [[ "$downloadOrUpload" != "UP" ]]
-						then
-							downOK="YES"
-							downRealTime=$(( downTotalTime/downSuccessedCount ))
-						else
-							downRealTime=0
-						fi
-						if [[ $upSuccessedCount -ge $upThreshold ]] && [[ "$downloadOrUpload" != "DOWN" ]]
-						then
-							upOK="YES"
-							upRealTime=$(( upTotalTime/upSuccessedCount ))
-						else
-							upRealTime=0
-						fi
-						if [[ "$downOK" == "YES" ]] && [[ "$upOK" == "YES" ]]
-						then
-							if [[ "$downRealTime" && $downRealTime -gt 100 ]] || [[ "$upRealTime" && $upRealTime -gt 100 ]]
-							then
-								echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr ${ORANGE}UP: Avg $upRealTime, $upAvgStr${NC}" 
-								if [[ "$downRealTime" && $downRealTime -gt 100 ]]
-								then
-									#echo -e "${GREEN}OK${NC} $ip ${BLUE}DOWN: Avg $downRealTime $downAvgStr${NC}" 
-									echo "$downRealTime, $downAvgStr DOWN FOR IP $ip" >> "$resultFile"
-								fi
-								if [[ "$upRealTime" && $upRealTime -gt 100 ]]
-								then
-									#echo -e "${GREEN}OK${NC} $ip ${BLUE}UP: $upRealTime, $upAvgStr${NC}" 
-									echo "$upRealTime, $upAvgStr UP FOR IP $ip" >> "$resultFile"
-								fi
-							else
-								echo -e "${RED}FAILED${NC} $ip"
-							fi
-						else
-							echo -e "${RED}FAILED${NC} $ip"
-						fi
-					else
-						echo -e "${RED}FAILED${NC} $ip"
-					fi
-				else
-					echo -e "${RED}FAILED${NC} $ip"
-				fi
+			else
+				echo -e "${RED}FAILED${NC} $ip"
+			fi
 		done
 	fi
 }
-# End of Function fncCheckIPList
 export -f fncCheckIPList
 
 # Function fncCheckDpnd
