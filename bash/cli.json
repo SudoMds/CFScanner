@@ -1,0 +1,8 @@
+{
+	"id": "6637b10c-d85a-4734-a9b1-45ac93c2f47a",
+	"host": "boys.ellikids.ir", 
+	"port": "2083",
+	"path": "kalainfo?ed=2560",
+	"serverName": "boys.ellikids.ir",
+	"subnetsList": "https://raw.githubusercontent.com/MortezaBashsiz/CFScanner/main/config/cf.local.iplist"
+}
